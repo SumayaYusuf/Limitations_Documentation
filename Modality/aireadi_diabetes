@@ -1,0 +1,428 @@
+"""
+AI-READI Dataset Loader Template for Sakana AI-Scientist-v2
+
+Data is available at: ../input/ relative to agent working directory (no Data_Read subfolder).
+
+Dataset: AI-READI mini v1.0.0 - Multi-modal diabetes study
+100 participants, 4 study groups:
+  - healthy
+  - pre_diabetes_lifestyle_controlled
+  - oral_medication_and_or_non_insulin_injectable_medication_controlled
+  - insulin_dependent
+
+Available modalities (see participants.tsv boolean flags):
+  - cardiac_ecg         : 12-lead ECG, Philips TC30, 500 Hz, WFDB format (.hea + .dat)
+  - clinical_data       : OMOP CDM CSVs (measurement, person, observation, condition_occurrence, ...)
+  - environment         : Leelab Anura environmental sensor JSON
+  - retinal_flio        : Retinal FLIO DICOM
+  - retinal_oct         : Retinal OCT DICOM (Topcon Maestro2, Topcon Triton, Zeiss Cirrus)
+  - retinal_octa        : Retinal OCTA DICOM (enface, flow_cube, segmentation)
+  - retinal_photography : Retinal CFP/FAF/IR DICOM (multiple devices)
+  - wearable_blood_glucose : Dexcom G6 CGM JSON (OpenMHealth schema)
+"""
+
+import os
+import json
+import glob
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sklearn.impute import SimpleImputer          # NOT sklearn.preprocessing
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression  # do NOT use multi_class= arg (removed in sklearn 1.5)
+from sklearn.metrics import roc_auc_score         # do NOT use classes= arg
+
+# Base data path: agents run from workspace/process_N/ so input is one level up
+# Data is at ../input/ directly (no Data_Read subfolder)
+DATA_ROOT = os.path.abspath(os.path.join(os.getcwd(), "../input"))
+# Fallback: walk up to find participants.tsv
+if not os.path.exists(os.path.join(DATA_ROOT, "Other_data", "participants.tsv")):
+    for _p in ["../input", "../../input", "input"]:
+        _candidate = os.path.abspath(os.path.join(os.getcwd(), _p))
+        if os.path.exists(os.path.join(_candidate, "Other_data", "participants.tsv")):
+            DATA_ROOT = _candidate
+            break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. PARTICIPANTS / METADATA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_participants() -> pd.DataFrame:
+    """Load the participants TSV.
+
+    Returns a DataFrame with columns:
+      person_id, clinical_site, study_group, age, study_visit_date,
+      recommended_split, cardiac_ecg, clinical_data, environment,
+      retinal_flio, retinal_oct, retinal_octa, retinal_photography,
+      wearable_activity_monitor, wearable_blood_glucose
+
+    study_group values: 'healthy', 'pre_diabetes_lifestyle_controlled',
+      'oral_medication_and_or_non_insulin_injectable_medication_controlled',
+      'insulin_dependent'
+    """
+    path = os.path.join(DATA_ROOT, "Other_data", "participants.tsv")
+    df = pd.read_csv(path, sep="\t")
+    # Convert TRUE/FALSE strings to booleans
+    bool_cols = ["cardiac_ecg", "clinical_data", "environment", "retinal_flio",
+                 "retinal_oct", "retinal_octa", "retinal_photography",
+                 "wearable_activity_monitor", "wearable_blood_glucose"]
+    for c in bool_cols:
+        if c in df.columns:
+            df[c] = df[c].map({"TRUE": True, "FALSE": False, True: True, False: False})
+    # IMPORTANT: Only 12 participants have actual data files in this local copy.
+    # Filter to participants who have at least one data file present on disk.
+    cgm_dir = os.path.join(DATA_ROOT, "wearable_blood_glucose", "continuous_glucose_monitoring", "dexcom_g6")
+    if os.path.exists(cgm_dir):
+        available_ids = set(int(p) for p in os.listdir(cgm_dir) if p.isdigit())
+        df = df[df["person_id"].isin(available_ids)].reset_index(drop=True)
+    return df
+
+
+def get_study_group_label(study_group: str) -> int:
+    """Map study group string to integer label (0=healthy, 1=pre-DM, 2=oral/inject, 3=insulin)."""
+    mapping = {
+        "healthy": 0,
+        "pre_diabetes_lifestyle_controlled": 1,
+        "oral_medication_and_or_non_insulin_injectable_medication_controlled": 2,
+        "insulin_dependent": 3,
+    }
+    return mapping.get(study_group, -1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. CLINICAL DATA (OMOP CDM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_clinical_data() -> dict:
+    """Load all OMOP CDM CSV files.
+
+    Returns dict with keys: measurement, person, observation,
+      condition_occurrence, procedure_occurrence, visit_occurrence
+    """
+    clinical_dir = os.path.join(DATA_ROOT, "clinical_data", "clinical_data")
+    tables = {}
+    for csv_file in glob.glob(os.path.join(clinical_dir, "*.csv")):
+        name = os.path.splitext(os.path.basename(csv_file))[0]
+        tables[name] = pd.read_csv(csv_file)
+    return tables
+
+
+def extract_clinical_features(participants: pd.DataFrame) -> pd.DataFrame:
+    """Extract per-participant clinical features from OMOP measurement table.
+
+    Returns a DataFrame indexed by person_id with numeric feature columns.
+    Key measurement_source_value patterns:
+      - 'viaodplog'/'viaosplog': Visual Acuity Letter Score (photopic OD/OS)
+      - 'viaodpscore'/'viaospscore': Photopic LogMAR OD/OS
+      - 'csodletter'/'csosletter': Contrast Sensitivity letter score
+      HbA1c and other lab values may also be present.
+    """
+    tables = load_clinical_data()
+    meas = tables.get("measurement", pd.DataFrame())
+    if meas.empty:
+        return pd.DataFrame(index=participants["person_id"])
+
+    # Pivot: one row per person, columns = mean of each measurement type
+    meas_clean = meas[["person_id", "measurement_source_value", "value_as_number"]].dropna()
+    # Keep only the short label before the comma
+    meas_clean = meas_clean.copy()
+    meas_clean["meas_name"] = meas_clean["measurement_source_value"].str.split(",").str[0].str.strip()
+    pivot = meas_clean.groupby(["person_id", "meas_name"])["value_as_number"].mean().unstack(fill_value=np.nan)
+    return pivot.reset_index().rename(columns={"person_id": "person_id"}).set_index("person_id")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. CONTINUOUS GLUCOSE MONITORING (CGM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_cgm_for_participant(person_id: int) -> pd.DataFrame:
+    """Load CGM JSON for a single participant.
+
+    Returns a DataFrame with columns: timestamp, glucose_mg_dl
+    JSON structure (OpenMHealth):
+      body.blood_glucose.value  (mg/dL)
+      body.effective_time_frame.date_time  (ISO timestamp)
+    """
+    pattern = os.path.join(
+        DATA_ROOT, "wearable_blood_glucose", "wearable_blood_glucose",
+        "continuous_glucose_monitoring", "dexcom_g6",
+        str(person_id), f"{person_id}_DEX.json"
+    )
+    files = glob.glob(pattern)
+    if not files:
+        return pd.DataFrame(columns=["timestamp", "glucose_mg_dl"])
+    with open(files[0]) as f:
+        data = json.load(f)
+    records = []
+    for entry in data:
+        body = entry.get("body", {})
+        bg = body.get("blood_glucose", {})
+        value = bg.get("value", None)
+        tf = body.get("effective_time_frame", {})
+        ts = tf.get("date_time", None)
+        if value is not None and ts is not None:
+            records.append({"timestamp": ts, "glucose_mg_dl": float(value)})
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
+def extract_cgm_features(person_id: int) -> dict:
+    """Compute glycemic variability features from CGM data.
+
+    Returns dict with:
+      cgm_mean, cgm_std, cgm_min, cgm_max,
+      time_in_range_70_180 (fraction), time_above_180 (fraction),
+      time_below_70 (fraction), n_readings
+    """
+    df = load_cgm_for_participant(person_id)
+    if df.empty or len(df) < 5:
+        return {k: np.nan for k in [
+            "cgm_mean", "cgm_std", "cgm_min", "cgm_max",
+            "time_in_range_70_180", "time_above_180", "time_below_70", "n_readings"
+        ]}
+    g = df["glucose_mg_dl"].values
+    return {
+        "cgm_mean": float(np.mean(g)),
+        "cgm_std": float(np.std(g)),
+        "cgm_min": float(np.min(g)),
+        "cgm_max": float(np.max(g)),
+        "time_in_range_70_180": float(np.mean((g >= 70) & (g <= 180))),
+        "time_above_180": float(np.mean(g > 180)),
+        "time_below_70": float(np.mean(g < 70)),
+        "n_readings": int(len(g)),
+    }
+
+
+def extract_all_cgm_features(participants: pd.DataFrame) -> pd.DataFrame:
+    """Extract CGM features for all participants with CGM data."""
+    rows = []
+    for _, row in participants.iterrows():
+        if row.get("wearable_blood_glucose", False):
+            feats = extract_cgm_features(row["person_id"])
+            feats["person_id"] = row["person_id"]
+            rows.append(feats)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("person_id")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. CARDIAC ECG (WFDB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_ecg_for_participant(person_id: int):
+    """Load 12-lead ECG signal for a participant using wfdb.
+
+    Returns (record, signal_array) where signal_array has shape (n_samples, 12).
+    Returns (None, None) if wfdb not available or no file found.
+
+    ECG format: Philips TC30, 500 Hz, 12 leads
+    """
+    try:
+        import wfdb
+    except ImportError:
+        print("wfdb not installed. Run: pip install wfdb")
+        return None, None
+
+    pattern = os.path.join(
+        DATA_ROOT, "cardiac_ecg", "cardiac_ecg", "ecg_12lead", "philips_tc30",
+        str(person_id), f"{person_id}_ecg_*.hea"
+    )
+    hea_files = glob.glob(pattern)
+    if not hea_files:
+        return None, None
+
+    record_path = hea_files[0].replace(".hea", "")
+    try:
+        record = wfdb.rdrecord(record_path)
+        return record, record.p_signal  # shape: (n_samples, 12)
+    except Exception as e:
+        print(f"Error loading ECG for {person_id}: {e}")
+        return None, None
+
+
+def extract_ecg_features(person_id: int) -> dict:
+    """Extract basic HRV and morphological features from 12-lead ECG."""
+    record, signal = load_ecg_for_participant(person_id)
+    nan_feats = {k: np.nan for k in [
+        "ecg_hr_mean", "ecg_rr_std", "ecg_lead_ii_mean", "ecg_lead_ii_std",
+        "ecg_n_samples", "ecg_fs"
+    ]}
+    if signal is None or record is None:
+        return nan_feats
+
+    fs = record.fs  # 500 Hz
+    # Lead II is index 1 in standard 12-lead (I, II, III, aVR, aVL, aVF, V1-V6)
+    lead_idx = 1  # Lead II
+    lead_signal = signal[:, lead_idx]
+
+    feats = {
+        "ecg_lead_ii_mean": float(np.mean(lead_signal)),
+        "ecg_lead_ii_std": float(np.std(lead_signal)),
+        "ecg_n_samples": int(len(lead_signal)),
+        "ecg_fs": float(fs),
+        "ecg_hr_mean": np.nan,
+        "ecg_rr_std": np.nan,
+    }
+
+    # Simple R-peak detection via threshold for HRV
+    try:
+        from scipy.signal import find_peaks
+        # Normalize signal
+        norm = (lead_signal - np.mean(lead_signal)) / (np.std(lead_signal) + 1e-8)
+        # Find peaks (R waves)
+        peaks, _ = find_peaks(norm, height=1.0, distance=int(0.4 * fs))
+        if len(peaks) > 2:
+            rr_intervals = np.diff(peaks) / fs  # in seconds
+            hr = 60.0 / rr_intervals  # bpm
+            feats["ecg_hr_mean"] = float(np.mean(hr))
+            feats["ecg_rr_std"] = float(np.std(rr_intervals) * 1000)  # ms
+    except Exception:
+        pass
+
+    return feats
+
+
+def extract_all_ecg_features(participants: pd.DataFrame) -> pd.DataFrame:
+    """Extract ECG features for all participants with ECG data."""
+    rows = []
+    for _, row in participants.iterrows():
+        if row.get("cardiac_ecg", False):
+            feats = extract_ecg_features(row["person_id"])
+            feats["person_id"] = row["person_id"]
+            rows.append(feats)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("person_id")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. RETINAL IMAGING (DICOM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def list_retinal_dicom_files(person_id: int, modality: str = "retinal_photography") -> list:
+    """List DICOM files for a participant in a given retinal modality.
+
+    modality options:
+      'retinal_photography'  -> CFP, FAF, IR images
+      'retinal_oct'          -> OCT B-scans and fundus
+      'retinal_octa'         -> OCTA flow cubes and enface
+      'retinal_flio'         -> FLIO lifetime images
+    """
+    pattern = os.path.join(
+        DATA_ROOT, modality, "**", str(person_id), "**", "*.dcm"
+    )
+    return glob.glob(pattern, recursive=True)
+
+
+def load_retinal_image(dcm_path: str) -> np.ndarray:
+    """Load a DICOM retinal image pixel array.
+
+    Returns numpy array of pixel values, or None if pydicom not available.
+    """
+    try:
+        import pydicom
+        ds = pydicom.dcmread(dcm_path)
+        return ds.pixel_array.astype(np.float32)
+    except ImportError:
+        print("pydicom not installed. Run: pip install pydicom")
+        return None
+    except Exception as e:
+        print(f"Error loading DICOM {dcm_path}: {e}")
+        return None
+
+
+def extract_retinal_features_for_participant(person_id: int, modality: str = "retinal_photography") -> dict:
+    """Extract basic intensity statistics from retinal images for one participant."""
+    nan_feats = {
+        "retinal_mean": np.nan, "retinal_std": np.nan,
+        "retinal_p25": np.nan, "retinal_p75": np.nan, "n_images": 0
+    }
+    dcm_files = list_retinal_dicom_files(person_id, modality)
+    if not dcm_files:
+        return nan_feats
+
+    all_means, all_stds = [], []
+    for f in dcm_files[:3]:  # limit to 3 images per participant for speed
+        img = load_retinal_image(f)
+        if img is not None:
+            all_means.append(float(np.mean(img)))
+            all_stds.append(float(np.std(img)))
+
+    if not all_means:
+        return nan_feats
+
+    return {
+        "retinal_mean": float(np.mean(all_means)),
+        "retinal_std": float(np.mean(all_stds)),
+        "retinal_p25": float(np.percentile(all_means, 25)),
+        "retinal_p75": float(np.percentile(all_means, 75)),
+        "n_images": len(dcm_files),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. FULL FEATURE MATRIX BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_feature_matrix(use_cgm=True, use_ecg=True, use_retinal=True, use_clinical=True) -> pd.DataFrame:
+    """Build a combined feature matrix for all participants.
+
+    Returns a DataFrame with person_id index, feature columns, and
+    'study_group' + 'label' columns (label = integer 0-3).
+    """
+    participants = load_participants()
+    df = participants[["person_id", "study_group", "age"]].copy()
+    df["label"] = df["study_group"].apply(get_study_group_label)
+    df = df.set_index("person_id")
+
+    if use_clinical:
+        print("Loading clinical features...")
+        clin = extract_clinical_features(participants)
+        df = df.join(clin, how="left")
+
+    if use_cgm:
+        print("Loading CGM features...")
+        cgm_feats = extract_all_cgm_features(participants)
+        df = df.join(cgm_feats, how="left")
+
+    if use_ecg:
+        print("Loading ECG features...")
+        ecg_feats = extract_all_ecg_features(participants)
+        df = df.join(ecg_feats, how="left")
+
+    if use_retinal:
+        print("Loading retinal image features...")
+        retinal_rows = []
+        for _, row in participants.iterrows():
+            if row.get("retinal_photography", False):
+                feats = extract_retinal_features_for_participant(row["person_id"])
+                feats["person_id"] = row["person_id"]
+                retinal_rows.append(feats)
+        if retinal_rows:
+            retinal_df = pd.DataFrame(retinal_rows).set_index("person_id")
+            df = df.join(retinal_df, how="left")
+
+    return df.reset_index()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUICK SANITY CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print(f"DATA_ROOT: {DATA_ROOT}")
+    print(f"DATA_ROOT exists: {os.path.exists(DATA_ROOT)}")
+
+    participants = load_participants()
+    print(f"\nParticipants: {len(participants)}")
+    print(participants["study_group"].value_counts())
+
+    print("\nBuilding feature matrix (CGM + clinical only for speed)...")
+    feat_df = build_feature_matrix(use_cgm=True, use_ecg=False, use_retinal=False, use_clinical=True)
+    print(f"Feature matrix shape: {feat_df.shape}")
+    print(feat_df.describe())
