@@ -1,0 +1,334 @@
+"""
+Contains functions to manually generate a textual preview of some common file types
+(.csv, .tsv, .json, .dcm, .hea, ..) for the agent.
+
+Extended to support the AI-READI multi-modal dataset:
+  - clinical_data/    : OMOP CDM CSVs
+  - cardiac_ecg/      : WFDB format (.hea header + .dat binary)
+  - retinal_*/        : DICOM files (.dcm)
+  - wearable_blood_glucose/ : OpenMHealth JSON
+  - environment/      : JSON sensor data
+  - Other_data/       : TSV participants file, markdown docs
+"""
+
+import json
+import os
+from pathlib import Path
+
+import humanize
+import pandas as pd
+from genson import SchemaBuilder
+from pandas.api.types import is_numeric_dtype
+
+# these files are treated as code (e.g. markdown wrapped)
+code_files = {".py", ".sh", ".yaml", ".yml", ".md", ".html", ".xml", ".log", ".rst"}
+# we treat these files as text (rather than binary) files
+plaintext_files = {".txt", ".csv", ".json", ".tsv"} | code_files
+
+# Medical / scientific binary formats we can summarize but not read as text
+medical_binary_suffixes = {".dcm", ".dat"}
+wfdb_header_suffix = ".hea"
+
+
+def get_file_len_size(f: Path) -> tuple[int, str]:
+    """
+    Calculate the size of a file (#lines for plaintext files, otherwise #bytes)
+    Also returns a human-readable string representation of the size.
+    """
+    if f.suffix in plaintext_files:
+        try:
+            num_lines = sum(1 for _ in open(f, encoding="utf-8", errors="replace"))
+            return num_lines, f"{num_lines} lines"
+        except Exception:
+            pass
+    s = f.stat().st_size
+    return s, humanize.naturalsize(s)
+
+
+def file_tree(path: Path, depth=0, max_depth=3) -> str:
+    """Generate a tree structure of files in a directory (capped to avoid explosion).
+
+    Large medical image directories (retinal_*, cardiac_ecg, etc.) are shown as
+    a one-line summary to keep the tree manageable.
+    """
+    if depth > max_depth:
+        return f"{' '*depth*4}... (truncated)"
+    result = []
+    try:
+        entries = list(Path(path).iterdir())
+    except PermissionError:
+        return f"{' '*depth*4}[permission denied]"
+
+    files = [p for p in entries if not p.is_dir()]
+    dirs = [p for p in entries if p.is_dir()]
+
+    # Cap number of files shown per directory to keep preview manageable
+    max_n = 3 if len(files) > 20 else 6
+    for p in sorted(files)[:max_n]:
+        try:
+            _, size_str = get_file_len_size(p)
+            result.append(f"{' '*depth*4}{p.name} ({size_str})")
+        except Exception:
+            result.append(f"{' '*depth*4}{p.name}")
+    if len(files) > max_n:
+        result.append(f"{' '*depth*4}... and {len(files)-max_n} other files")
+
+    for p in sorted(dirs):
+        dir_key = p.name.lower()
+        if dir_key in _LARGE_BINARY_DIR_KEYWORDS and depth >= 1:
+            # Summarize large binary dirs instead of recursing
+            try:
+                total = sum(1 for _ in _walk(p))
+                result.append(f"{' '*depth*4}{p.name}/ [{total} files - summarized below]")
+            except Exception:
+                result.append(f"{' '*depth*4}{p.name}/ [large binary dir]")
+        else:
+            result.append(f"{' '*depth*4}{p.name}/")
+            result.append(file_tree(p, depth + 1, max_depth))
+
+    return "\n".join(result)
+
+
+def _walk(path: Path):
+    """Recursively walk a directory (analogous to os.walk but for pathlib.Path)"""
+    for p in sorted(Path(path).iterdir()):
+        if p.is_dir():
+            yield from _walk(p)
+            continue
+        yield p
+
+
+def preview_csv(p: Path, file_name: str, simple=True) -> str:
+    """Generate a textual preview of a csv/tsv file."""
+    sep = "\t" if p.suffix == ".tsv" else ","
+    try:
+        df = pd.read_csv(p, sep=sep)
+    except Exception as e:
+        return f"-> {file_name}: could not parse ({e})"
+
+    out = [f"-> {file_name} has {df.shape[0]} rows and {df.shape[1]} columns."]
+
+    if simple:
+        cols = df.columns.tolist()
+        sel_cols = 15
+        cols_str = ", ".join(cols[:sel_cols])
+        res = f"The columns are: {cols_str}"
+        if len(cols) > sel_cols:
+            res += f" ... and {len(cols)-sel_cols} more columns"
+        out.append(res)
+    else:
+        out.append("Here is some information about the columns:")
+        for col in sorted(df.columns):
+            dtype = df[col].dtype
+            name = f"{col} ({dtype})"
+            nan_count = df[col].isnull().sum()
+
+            if dtype == "bool":
+                v = df[col][df[col].notnull()].mean()
+                out.append(f"{name} is {v*100:.2f}% True, {100-v*100:.2f}% False")
+            elif df[col].nunique() < 10:
+                out.append(
+                    f"{name} has {df[col].nunique()} unique values: {df[col].unique().tolist()}"
+                )
+            elif is_numeric_dtype(df[col]):
+                out.append(
+                    f"{name} has range: {df[col].min():.2f} - {df[col].max():.2f}, {nan_count} nan values"
+                )
+            elif dtype == "object":
+                out.append(
+                    f"{name} has {df[col].nunique()} unique values. Some example values: {df[col].value_counts().head(4).index.tolist()}"
+                )
+
+    return "\n".join(out)
+
+
+def preview_json(p: Path, file_name: str, max_schema_chars: int = 1500) -> str:
+    """Generate a textual preview of a json file using a generated json schema."""
+    try:
+        builder = SchemaBuilder()
+        with open(p, encoding="utf-8", errors="replace") as f:
+            builder.add_object(json.load(f))
+        schema_str = builder.to_json(indent=2)
+        if len(schema_str) > max_schema_chars:
+            schema_str = schema_str[:max_schema_chars] + "\n  ... (schema truncated)"
+        return f"-> {file_name} has auto-generated json schema:\n" + schema_str
+    except Exception as e:
+        return f"-> {file_name}: could not parse JSON ({e})"
+
+
+def preview_dicom(p: Path, file_name: str) -> str:
+    """Generate a textual preview of a DICOM file."""
+    try:
+        import pydicom
+        ds = pydicom.dcmread(str(p), stop_before_pixels=True)
+        modality = getattr(ds, "Modality", "Unknown")
+        rows = getattr(ds, "Rows", "?")
+        cols = getattr(ds, "Columns", "?")
+        series_desc = getattr(ds, "SeriesDescription", "")
+        study_desc = getattr(ds, "StudyDescription", "")
+        patient_id = getattr(ds, "PatientID", "")
+        return (
+            f"-> {file_name} [DICOM] Modality={modality}, "
+            f"Size={rows}x{cols}, "
+            f"Series='{series_desc}', Study='{study_desc}', PatientID='{patient_id}'"
+        )
+    except ImportError:
+        size_str = humanize.naturalsize(p.stat().st_size)
+        return f"-> {file_name} [DICOM binary, {size_str}] (install pydicom for metadata)"
+    except Exception as e:
+        size_str = humanize.naturalsize(p.stat().st_size)
+        return f"-> {file_name} [DICOM binary, {size_str}] (could not read: {e})"
+
+
+def preview_wfdb_header(p: Path, file_name: str) -> str:
+    """Generate a textual preview of a WFDB .hea header file (PhysioNet ECG format)."""
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        out = [f"-> {file_name} [WFDB ECG header]"]
+        # First line: record_name num_signals fs num_samples
+        if lines:
+            out.append(f"   Header: {lines[0]}")
+        # Signal lines
+        for line in lines[1:]:
+            if line.strip() and not line.startswith("#"):
+                out.append(f"   Signal: {line.strip()}")
+        return "\n".join(out)
+    except Exception as e:
+        return f"-> {file_name} [WFDB header] (could not read: {e})"
+
+
+def _count_files_by_ext(path: Path) -> dict:
+    """Count files by extension in a directory tree."""
+    counts = {}
+    for p in _walk(path):
+        ext = p.suffix.lower()
+        counts[ext] = counts.get(ext, 0) + 1
+    return counts
+
+
+def preview_modality_dir(path: Path, rel_name: str) -> str:
+    """
+    For large directories of binary medical images (retinal_*, cardiac_ecg, etc.),
+    give a high-level summary instead of listing every file.
+    """
+    counts = _count_files_by_ext(path)
+    total = sum(counts.values())
+    ext_summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: -x[1])[:6])
+    out = [f"-> {rel_name}/ [{total} files total: {ext_summary}]"]
+
+    # Sample one DICOM file to show metadata
+    dcm_files = list(path.rglob("*.dcm"))
+    if dcm_files:
+        sample = dcm_files[0]
+        out.append(f"   Sample DICOM: {preview_dicom(sample, sample.name)}")
+
+    # Sample one WFDB header
+    hea_files = list(path.rglob("*.hea"))
+    if hea_files:
+        sample = hea_files[0]
+        out.append(f"   Sample ECG header: {preview_wfdb_header(sample, sample.name)}")
+
+    # List subdirectory names (device/participant structure)
+    subdirs = sorted([d.name for d in path.iterdir() if d.is_dir()])[:5]
+    if subdirs:
+        out.append(f"   Subdirectories: {', '.join(subdirs)}")
+
+    return "\n".join(out)
+
+
+# Directories whose names indicate large collections - summarize instead of walking
+_LARGE_BINARY_DIR_KEYWORDS = {
+    "retinal_flio", "retinal_oct", "retinal_octa", "retinal_photography",
+    "cardiac_ecg", "wearable_activity_monitor", "environment",
+    "wearable_blood_glucose",
+}
+
+
+def generate(base_path, include_file_details=True, simple=False):
+    """
+    Generate a textual preview of a directory, including an overview of the directory
+    structure and previews of individual files.
+
+    For the AI-READI dataset:
+    - DICOM files (.dcm): summarized per modality directory
+    - WFDB ECG headers (.hea): shown with signal info
+    - TSV files: treated like CSVs
+    - JSON files: schema shown
+    - Large binary directories: high-level count summary + one sample
+
+    NOTE FOR AGENTS: Data files are available at '../input/' relative to
+    your working directory (os.getcwd()). Agents run from workspace/process_N/
+    so input is ONE level up. There is NO 'Data_Read' subfolder. For example:
+      - pd.read_csv('../input/clinical_data/clinical_data/measurement.csv')
+      - participants = pd.read_csv('../input/Other_data/participants.tsv', sep='\\t')
+    Use this DATA_ROOT pattern:
+      DATA_ROOT = os.path.abspath(os.path.join(os.getcwd(), '../input'))
+    """
+    base_path = Path(base_path)
+    tree = f"```\n{file_tree(base_path)}```"
+    out = [tree]
+
+    # Add data access note for agents
+    out.append(
+        "NOTE FOR AGENTS: Access data via relative path '../input/' from os.getcwd().\n"
+        "Agents run from workspace/process_N/ — input is ONE level up. No 'Data_Read' subfolder.\n"
+        "DATA_ROOT = os.path.abspath(os.path.join(os.getcwd(), '../input'))\n"
+        "Example: df = pd.read_csv('../input/clinical_data/clinical_data/measurement.csv')\n"
+        "         participants = pd.read_csv('../input/Other_data/participants.tsv', sep='\\t')"
+    )
+
+    if include_file_details:
+        # First handle top-level modality directories with special treatment
+        for top_dir in sorted(base_path.iterdir()):
+            if not top_dir.is_dir():
+                continue
+            dir_key = top_dir.name.lower()
+
+            if dir_key in _LARGE_BINARY_DIR_KEYWORDS:
+                # Summarize entire modality directory at high level
+                rel = str(top_dir.relative_to(base_path))
+                out.append(preview_modality_dir(top_dir, rel))
+                continue
+
+            # For other directories (Other_data, clinical_data, etc.), walk normally
+            json_shown = 0  # cap JSON schema previews per directory
+            for fn in _walk(top_dir):
+                file_name = str(fn.relative_to(base_path))
+
+                if fn.suffix == ".csv":
+                    out.append(preview_csv(fn, file_name, simple=simple))
+                elif fn.suffix == ".tsv":
+                    out.append(preview_csv(fn, file_name, simple=simple))
+                elif fn.suffix == ".json":
+                    if json_shown < 3:  # show at most 3 JSON schemas per dir
+                        out.append(preview_json(fn, file_name))
+                        json_shown += 1
+                elif fn.suffix == ".dcm":
+                    out.append(preview_dicom(fn, file_name))
+                elif fn.suffix == wfdb_header_suffix:
+                    out.append(preview_wfdb_header(fn, file_name))
+                elif fn.suffix in code_files:
+                    try:
+                        n_lines, _ = get_file_len_size(fn)
+                        if n_lines < 40:
+                            with open(fn, encoding="utf-8", errors="replace") as f:
+                                content = f.read()
+                                out.append(f"-> {file_name} has content:\n\n```\n{content}\n```")
+                    except Exception:
+                        pass
+                elif fn.suffix in plaintext_files:
+                    try:
+                        n_lines, _ = get_file_len_size(fn)
+                        if n_lines < 30:
+                            with open(fn, encoding="utf-8", errors="replace") as f:
+                                out.append(f"-> {file_name} has content:\n\n{f.read()}")
+                    except Exception:
+                        pass
+
+    result = "\n\n".join(out)
+
+    # If still very long, generate simpler version
+    if len(result) > 8_000 and not simple:
+        return generate(base_path, include_file_details=include_file_details, simple=True)
+
+    return result
